@@ -1,31 +1,27 @@
 import { useEffect, useMemo, useState } from 'react';
+import type { ReactNode } from 'react';
 import {
   AlertTriangle, Camera, Clock3, Download, Flag, Gavel, History, Play, Plus,
   Redo2, RotateCcw, Shuffle, Trash2, Trophy, Undo2, UserMinus, UserPlus, Users, X,
 } from 'lucide-react';
 import {
-  conflictMatches, currentRound, describeEvent, planRound, playerName, reduceEvents,
-  resultLabel, standings, unresolvedMatches,
+  conflictMatches, currentRound, describeEvent, isRuled, maybeRepair, planRound, playerName,
+  reduceEvents, resultLabel, roundDirty, standings, unresolvedMatches,
 } from './engine';
 import type { Event, Match, ResultCode, Round, State } from './engine';
-
-// ---------------- 持久化文档：事件只增不删，head 指针移动实现撤销/恢复 ----------------
-
-interface Snap { id: string; label: string; head: number; at: number; auto?: boolean }
-interface MetaEntry { at: number; text: string }
-interface Doc { events: Event[]; head: number; snaps: Snap[]; meta: MetaEntry[] }
+import {
+  blankDoc, migrateDoc, pushEvents, redo, restoreSnap, restoreToStep, takeSnapshot, undo,
+} from './doc';
+import type { Doc } from './doc';
 
 const KEY = 'swiss-desk-v1';
-const blank: Doc = { events: [], head: 0, snaps: [], meta: [] };
 
 function loadDoc(): Doc {
   try {
     const raw = localStorage.getItem(KEY);
-    if (!raw) return blank;
-    const d = JSON.parse(raw) as Doc;
-    if (!Array.isArray(d.events) || typeof d.head !== 'number') return blank;
-    return { events: d.events, head: Math.min(Math.max(d.head, 0), d.events.length), snaps: d.snaps ?? [], meta: d.meta ?? [] };
-  } catch { return blank; }
+    if (!raw) return blankDoc();
+    return migrateDoc(JSON.parse(raw));
+  } catch { return blankDoc(); }
 }
 
 const ACTORS = ['裁判甲', '裁判乙', '裁判长'] as const;
@@ -37,6 +33,17 @@ const fmtCountdown = (ms: number) => {
   return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 };
 
+// ---------------- 页面内确认/输入对话框（不依赖浏览器弹窗） ----------------
+
+interface DialogSpec {
+  title: string;
+  body?: ReactNode;
+  input?: { defaultValue?: string; placeholder?: string };
+  okText?: string;
+  danger?: boolean;
+  onOk: (value: string) => void;
+}
+
 export default function App() {
   const [doc, setDoc] = useState<Doc>(loadDoc);
   const [actor, setActor] = useState<Actor>('裁判甲');
@@ -47,6 +54,8 @@ export default function App() {
   const [warnings, setWarnings] = useState<string[]>([]);
   const [swapMode, setSwapMode] = useState(false);
   const [swapSel, setSwapSel] = useState<{ matchId: string; slot: 1 | 2 } | null>(null);
+  const [dialog, setDialog] = useState<DialogSpec | null>(null);
+  const [dialogVal, setDialogVal] = useState('');
 
   // 任何改动 → 由事件流整体重算：排名、对手分、后续配对全部自动刷新
   const st: State = useMemo(() => reduceEvents(doc.events.slice(0, doc.head)), [doc.events, doc.head]);
@@ -58,127 +67,188 @@ export default function App() {
   const unresolved = unresolvedMatches(st);
   const shownRound = viewRound ?? cur?.n ?? null;
 
+  const openDialog = (spec: DialogSpec) => { setDialogVal(spec.input?.defaultValue ?? ''); setDialog(spec); };
+  const closeDialog = () => setDialog(null);
+
   // ---------------- 基础动作 ----------------
 
-  const push = (ev: Event) =>
-    setDoc(d => ({ ...d, events: [...d.events, ev], head: d.events.length + 1 }));
-
-  const logMeta = (text: string) =>
-    setDoc(d => ({ ...d, meta: [...d.meta, { at: Date.now(), text }] }));
-
-  const undo = () => setDoc(d => d.head > 0
-    ? { ...d, head: d.head - 1, meta: [...d.meta, { at: Date.now(), text: `撤销一步（回到第 ${d.head - 1} 步）` }] }
-    : d);
-
-  const redo = () => setDoc(d => d.head < d.events.length
-    ? { ...d, head: d.head + 1, meta: [...d.meta, { at: Date.now(), text: `重做一步（前进到第 ${d.head + 1} 步）` }] }
-    : d);
-
-  const restoreTo = (head: number, label: string) => {
-    if (!window.confirm(`确定恢复到「${label}」？\n当前进度不会被删除，随时可以再恢复回来。`)) return;
-    setDoc(d => ({ ...d, head, meta: [...d.meta, { at: Date.now(), text: `恢复到「${label}」（第 ${head} 步）` }] }));
-    setViewRound(null);
+  /** 派发事件：先截断回退分支，再检查是否需要按新排名自动重排最新轮 */
+  const dispatch = (ev: Event) => {
+    const chain = doc.events.slice(0, doc.head);
+    const st2 = reduceEvents([...chain, ev]);
+    const repair = maybeRepair(st2, ev, Date.now());
+    setDoc(d => pushEvents(d, repair ? [ev, repair] : [ev]));
+    if (repair && repair.type === 'REPAIR_ROUND') {
+      setWarnings([`较早赛果变更：第 ${repair.round.n} 轮已按最新排名重新配对，原对阵保留在裁定链与快照中。`]);
+    }
   };
 
-  const takeSnapshot = (label: string, auto = false, head?: number) =>
-    setDoc(d => ({ ...d, snaps: [...d.snaps, { id: `s${Date.now()}${Math.floor(Math.random() * 1e4)}`, label, head: head ?? d.head, at: Date.now(), auto }] }));
+  const askRestoreStep = (k: number, label: string) =>
+    openDialog({
+      title: '恢复历史进度',
+      body: `确定恢复到「${label}」？当前进度不会被删除，会保留在回退分支与快照中，随时可再恢复。`,
+      okText: '恢复',
+      onOk: () => { setDoc(d => restoreToStep(d, k)); setViewRound(null); },
+    });
 
-  const manualSnapshot = () => {
-    const label = window.prompt('快照名称', `第 ${cur?.n ?? 0} 轮进行中`);
-    if (label) { takeSnapshot(label); logMeta(`创建快照「${label}」`); }
-  };
+  const askRestoreSnap = (snapId: string, label: string) =>
+    openDialog({
+      title: '恢复快照',
+      body: `确定恢复到快照「${label}」？当前进度会存入回退分支，不会被覆盖。`,
+      okText: '恢复快照',
+      onOk: () => { setDoc(d => restoreSnap(d, snapId)); setViewRound(null); },
+    });
+
+  const manualSnapshot = () =>
+    openDialog({
+      title: '保存快照',
+      input: { defaultValue: `第 ${cur?.n ?? 0} 轮进行中`, placeholder: '快照名称' },
+      okText: '保存',
+      onOk: v => { if (v.trim()) setDoc(d => takeSnapshot(d, v.trim())); },
+    });
 
   // ---------------- 赛事流程 ----------------
 
-  const genRound = () => {
-    if (st.status !== 'active') return;
+  const doGenRound = () => {
     const un = unresolvedMatches(st);
-    if (un.length > 0) {
-      const list = un.map(m => `${playerName(st, m.p1)} vs ${playerName(st, m.p2)}`).join('；');
-      if (!window.confirm(`还有 ${un.length} 场未报分：\n${list}\n\n这些场次将自动判双负，然后生成下一轮。继续？`)) return;
-    }
     const plan = planRound(st, Date.now());
-    if (plan.round.matches.length === 0) { window.alert('没有可配对的在赛选手'); return; }
-    takeSnapshot(`第 ${plan.round.n} 轮开赛前`, true);
-    push({
+    if (plan.round.matches.length === 0) { setWarnings(['没有可配对的在赛选手']); return; }
+    const ev: Event = {
       type: 'NEW_ROUND',
       round: { ...plan.round, startedAt: Date.now() },
       forfeits: un.map(m => ({ matchId: m.id, note: '超时未报/未决，生成下一轮时自动判双负' })),
       at: Date.now(),
-    });
+    };
+    setDoc(d => pushEvents(takeSnapshot(d, `第 ${plan.round.n} 轮开赛前`, true), [ev]));
     setWarnings(plan.warnings);
     setViewRound(plan.round.n);
     setSwapMode(false); setSwapSel(null);
   };
 
+  const genRound = () => {
+    if (st.status !== 'active') return;
+    const un = unresolvedMatches(st);
+    if (un.length > 0) {
+      openDialog({
+        title: '生成下一轮',
+        body: (
+          <>
+            <p>还有 {un.length} 场未报分，将自动判双负：</p>
+            <ul>{un.map(m => <li key={m.id}>{playerName(st, m.p1)} vs {playerName(st, m.p2)}</li>)}</ul>
+          </>
+        ),
+        okText: '判双负并生成',
+        onOk: doGenRound,
+      });
+    } else doGenRound();
+  };
+
   const repairRound = () => {
     if (!cur) return;
-    if (cur.matches.some(m => m.result != null || m.submissions.length > 0)) {
-      window.alert('本轮已有报分记录，不能整体重排（可用改配或撤销单场的重报）');
-      return;
-    }
-    if (!window.confirm(`重新编排第 ${cur.n} 轮？现有对阵将被替换（历史记录仍保留）。`)) return;
-    const plan = planRound(st, Date.now());
-    push({
-      type: 'REPAIR_ROUND',
-      round: { ...plan.round, n: cur.n, startedAt: Date.now(), matches: plan.round.matches.map(m => ({ ...m, round: cur.n })) },
-      at: Date.now(),
+    if (roundDirty(cur)) { setWarnings(['本轮已有报分记录，不能整体重排（可用改配或撤销单场重报）']); return; }
+    openDialog({
+      title: `重新编排第 ${cur.n} 轮`,
+      body: '现有对阵将被替换（原对阵保留在裁定链中，可恢复）。确定重排？',
+      okText: '重新编排',
+      onOk: () => {
+        const plan = planRound(st, Date.now());
+        dispatch({
+          type: 'REPAIR_ROUND',
+          round: { ...plan.round, n: cur.n, startedAt: Date.now(), matches: plan.round.matches.map(m => ({ ...m, round: cur.n })) },
+          reason: '裁判手动重排',
+          at: Date.now(),
+        });
+      },
     });
-    setWarnings(plan.warnings);
   };
 
   const report = (m: Match, result: ResultCode) => {
+    const p1 = playerName(st, m.p1), p2 = playerName(st, m.p2);
     if (actor === '裁判长') {
-      const note = m.status === 'conflict'
-        ? window.prompt('裁定理由（会记入裁定链）', '核实双方记录后裁定') ?? ''
-        : '裁判长直裁';
-      push({ type: 'ADJUDICATE', matchId: m.id, actor, result, note, at: Date.now() });
+      if (m.status === 'conflict') {
+        openDialog({
+          title: '裁定冲突报分',
+          body: (
+            <>
+              <p>两台报分不一致，请选择认定结果（当前选择：<b>{resultLabel(result, p1, p2)}</b>）：</p>
+              <ul>{m.submissions.map((s, i) => <li key={i}>{s.actor} → {resultLabel(s.result, p1, p2)}</li>)}</ul>
+            </>
+          ),
+          input: { defaultValue: '核实双方记录后裁定', placeholder: '裁定理由（记入裁定链）' },
+          okText: '确认裁定',
+          onOk: note => dispatch({ type: 'ADJUDICATE', matchId: m.id, actor, result, note, at: Date.now() }),
+        });
+      } else {
+        dispatch({ type: 'ADJUDICATE', matchId: m.id, actor, result, note: '裁判长直裁', at: Date.now() });
+      }
     } else {
-      push({ type: 'SUBMIT', matchId: m.id, actor, result, at: Date.now() });
+      dispatch({ type: 'SUBMIT', matchId: m.id, actor, result, at: Date.now() });
     }
   };
 
-  const voidResult = (m: Match) => {
-    const note = window.prompt('撤销原因（会记入裁定链）', '报分有误，重新录入');
-    if (note === null) return;
-    push({ type: 'VOID', matchId: m.id, actor, note, at: Date.now() });
-  };
+  const voidResult = (m: Match) =>
+    openDialog({
+      title: '撤销本场结果',
+      body: `${playerName(st, m.p1)} vs ${playerName(st, m.p2)} 的结果将被清空，重新报分。`,
+      input: { defaultValue: '报分有误，重新录入', placeholder: '撤销原因（记入裁定链）' },
+      okText: '撤销结果',
+      danger: true,
+      onOk: note => dispatch({ type: 'VOID', matchId: m.id, actor, note, at: Date.now() }),
+    });
 
   const makeup = (m: Match) => {
     if (!cur) return;
-    if (!window.confirm(`为「${playerName(st, m.p1)} vs ${playerName(st, m.p2)}」安排补赛？\n补赛将加入第 ${cur.n} 轮，原场次保留记录但不再计分。`)) return;
-    const table = Math.max(0, ...cur.matches.map(x => x.table)) + 1;
-    push({
-      type: 'MAKEUP',
-      match: {
-        id: `m${st.seq}`, round: cur.n, section: m.section, table,
-        p1: m.p1, p2: m.p2, result: null, status: 'pending',
-        submissions: [], adjudications: [], origin: 'makeup', makeupOf: m.id,
+    openDialog({
+      title: '安排补赛',
+      body: `为「${playerName(st, m.p1)} vs ${playerName(st, m.p2)}」安排补赛？补赛加入第 ${cur.n} 轮，原场次保留记录但不再计分。`,
+      okText: '安排补赛',
+      onOk: () => {
+        const table = Math.max(0, ...cur.matches.map(x => x.table)) + 1;
+        dispatch({
+          type: 'MAKEUP',
+          match: {
+            id: `m${st.seq}`, round: cur.n, section: m.section, table,
+            p1: m.p1, p2: m.p2, result: null, status: 'pending',
+            submissions: [], adjudications: [], origin: 'makeup', makeupOf: m.id,
+          },
+          originalId: m.id, actor, at: Date.now(),
+        });
+        setViewRound(cur.n);
       },
-      originalId: m.id, actor, at: Date.now(),
     });
-    setViewRound(cur.n);
   };
+
+  const withdraw = (pid: string) =>
+    openDialog({
+      title: '临时退赛',
+      body: `${playerName(st, pid)} 临时退赛？后续轮次不再配对，已赛成绩保留，可随时恢复参赛。`,
+      okText: '确认退赛',
+      onOk: () => dispatch({ type: 'WITHDRAW', playerId: pid, at: Date.now() }),
+    });
+
+  const endTournament = () =>
+    openDialog({
+      title: '结束赛事',
+      body: unresolved.length ? `还有 ${unresolved.length} 场未报分。结束后仍可查看与恢复历史。` : '结束后仍可查看排名与恢复历史。',
+      okText: '结束赛事',
+      onOk: () => dispatch({ type: 'END', at: Date.now() }),
+    });
+
+  const resetAll = () =>
+    openDialog({
+      title: '清空全部数据',
+      body: '删除所有选手、赛程、裁定与快照，此操作不可恢复。',
+      okText: '全部清空',
+      danger: true,
+      onOk: () => { localStorage.removeItem(KEY); setDoc(blankDoc()); setViewRound(null); setWarnings([]); },
+    });
 
   const clickSlot = (matchId: string, slot: 1 | 2) => {
     if (!swapMode) return;
     if (!swapSel) { setSwapSel({ matchId, slot }); return; }
     if (swapSel.matchId === matchId && swapSel.slot === slot) { setSwapSel(null); return; }
-    push({ type: 'SWAP', matchA: swapSel.matchId, slotA: swapSel.slot, matchB: matchId, slotB: slot, actor, at: Date.now() });
+    dispatch({ type: 'SWAP', matchA: swapSel.matchId, slotA: swapSel.slot, matchB: matchId, slotB: slot, actor, at: Date.now() });
     setSwapSel(null);
-  };
-
-  const endTournament = () => {
-    const un = unresolvedMatches(st);
-    const msg = un.length ? `还有 ${un.length} 场未报分，结束前请先处理。仍要结束吗？` : '确定结束赛事？结束后仍可查看与恢复历史。';
-    if (window.confirm(msg)) push({ type: 'END', at: Date.now() });
-  };
-
-  const resetAll = () => {
-    if (window.confirm('清空本赛事全部数据？此操作不可恢复。') && window.confirm('再次确认：删除所有选手、赛程、裁定与快照？')) {
-      localStorage.removeItem(KEY);
-      setDoc(blank); setViewRound(null); setWarnings([]);
-    }
   };
 
   // ---------------- 导出 ----------------
@@ -233,8 +303,8 @@ export default function App() {
               {ACTORS.map(a => <option key={a}>{a}</option>)}
             </select>
           </label>
-          <button className="btn" onClick={undo} disabled={doc.head === 0} title="撤销一步"><Undo2 size={14} /></button>
-          <button className="btn" onClick={redo} disabled={doc.head >= doc.events.length} title="重做一步"><Redo2 size={14} /></button>
+          <button className="btn" onClick={() => setDoc(d => undo(d))} disabled={doc.head === 0} title="撤销一步"><Undo2 size={14} /></button>
+          <button className="btn" onClick={() => setDoc(d => redo(d))} disabled={doc.head >= doc.events.length} title="重做一步"><Redo2 size={14} /></button>
           <button className="btn" onClick={manualSnapshot} title="保存当前进度为快照"><Camera size={14} /> 快照</button>
           <button className="btn" onClick={exportMd} title="导出排名与赛程"><Download size={14} /></button>
           <button className="btn ghost-danger" onClick={resetAll} title="清空全部数据"><Trash2 size={14} /></button>
@@ -250,11 +320,11 @@ export default function App() {
       )}
 
       <div className="layout">
-        <PlayersPanel st={st} actor={actor} push={push} />
+        <PlayersPanel st={st} actor={actor} dispatch={dispatch} onWithdraw={withdraw} />
 
         <main className="content">
           {st.status === 'setup' ? (
-            <SetupPanel st={st} push={push} />
+            <SetupPanel st={st} dispatch={dispatch} />
           ) : (
             <>
               <nav className="tabs">
@@ -278,11 +348,11 @@ export default function App() {
                 />
               )}
               {tab === 'rank' && <RankView st={st} />}
-              {tab === 'log' && <LogView doc={doc} st={st} restoreTo={restoreTo} />}
+              {tab === 'log' && <LogView doc={doc} st={st} askRestore={askRestoreStep} />}
               {tab === 'snap' && (
                 <SnapView
                   doc={doc}
-                  restoreTo={restoreTo}
+                  askRestoreSnap={askRestoreSnap}
                   delSnap={id => setDoc(d => ({ ...d, snaps: d.snaps.filter(s => s.id !== id) }))}
                 />
               )}
@@ -290,13 +360,40 @@ export default function App() {
           )}
         </main>
       </div>
+
+      {dialog && (
+        <div className="dialog-backdrop" onClick={closeDialog}>
+          <div className="dialog" onClick={e => e.stopPropagation()}>
+            <h3>{dialog.title}</h3>
+            {dialog.body && <div className="dialog-body">{dialog.body}</div>}
+            {dialog.input && (
+              <input
+                autoFocus
+                value={dialogVal}
+                placeholder={dialog.input.placeholder}
+                onChange={e => setDialogVal(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') { dialog.onOk(dialogVal); closeDialog(); } }}
+              />
+            )}
+            <div className="dialog-actions">
+              <button className="btn" onClick={closeDialog}>取消</button>
+              <button
+                className={dialog.danger ? 'btn danger' : 'btn primary'}
+                onClick={() => { dialog.onOk(dialogVal); closeDialog(); }}
+              >{dialog.okText ?? '确定'}</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 // ---------------- 选手面板 ----------------
 
-function PlayersPanel({ st, actor, push }: { st: State; actor: string; push: (e: Event) => void }) {
+function PlayersPanel({ st, actor, dispatch, onWithdraw }: {
+  st: State; actor: string; dispatch: (e: Event) => void; onWithdraw: (pid: string) => void;
+}) {
   const [name, setName] = useState('');
   const [section, setSection] = useState('');
   const [bulk, setBulk] = useState('');
@@ -307,7 +404,7 @@ function PlayersPanel({ st, actor, push }: { st: State; actor: string; push: (e:
   const addOne = () => {
     const n = name.trim();
     if (!n) return;
-    push({ type: 'ADD_PLAYER', player: { id: `p${st.seq}`, name: n, section: section.trim() || '默认组', withdrawn: false }, at: Date.now() });
+    dispatch({ type: 'ADD_PLAYER', player: { id: `p${st.seq}`, name: n, section: section.trim() || '默认组', withdrawn: false }, at: Date.now() });
     setName('');
   };
 
@@ -315,7 +412,7 @@ function PlayersPanel({ st, actor, push }: { st: State; actor: string; push: (e:
     const lines = bulk.split('\n').map(s => s.trim()).filter(Boolean);
     lines.forEach((line, i) => {
       const [n, sec] = line.split(/[,，\t]/).map(s => s.trim());
-      if (n) push({ type: 'ADD_PLAYER', player: { id: `p${st.seq + i}`, name: n, section: sec || '默认组', withdrawn: false }, at: Date.now() });
+      if (n) dispatch({ type: 'ADD_PLAYER', player: { id: `p${st.seq + i}`, name: n, section: sec || '默认组', withdrawn: false }, at: Date.now() });
     });
     setBulk(''); setShowBulk(false);
   };
@@ -325,7 +422,7 @@ function PlayersPanel({ st, actor, push }: { st: State; actor: string; push: (e:
       ['王弈秋', '公开组'], ['李忘忧', '公开组'], ['张镇辉', '公开组'], ['陈守拙', '公开组'], ['刘劫争', '公开组'], ['赵收官', '公开组'],
       ['孙小飞', '少年组'], ['周小星', '少年组'], ['吴小目', '少年组'], ['郑小高', '少年组'], ['林小布局', '少年组'],
     ];
-    demo.forEach(([n, sec], i) => push({ type: 'ADD_PLAYER', player: { id: `p${st.seq + i}`, name: n, section: sec, withdrawn: false }, at: Date.now() }));
+    demo.forEach(([n, sec], i) => dispatch({ type: 'ADD_PLAYER', player: { id: `p${st.seq + i}`, name: n, section: sec, withdrawn: false }, at: Date.now() }));
   };
 
   const scoreOf = (pid: string, sec: string) => standings(st, sec).find(r => r.player.id === pid)?.score ?? 0;
@@ -367,14 +464,11 @@ function PlayersPanel({ st, actor, push }: { st: State; actor: string; push: (e:
                 <span className="pname">{p.name}</span>
                 {!setup && <span className="pscore">{scoreOf(p.id, sec)} 分</span>}
                 {setup ? (
-                  <button className="icon-btn" title="移除" onClick={() => push({ type: 'REMOVE_PLAYER', playerId: p.id, at: Date.now() })}><Trash2 size={13} /></button>
+                  <button className="icon-btn" title="移除" onClick={() => dispatch({ type: 'REMOVE_PLAYER', playerId: p.id, at: Date.now() })}><Trash2 size={13} /></button>
                 ) : p.withdrawn ? (
-                  <button className="icon-btn ok" title="恢复参赛" onClick={() => push({ type: 'REINSTATE', playerId: p.id, at: Date.now() })}><UserPlus size={13} /></button>
+                  <button className="icon-btn ok" title="恢复参赛" onClick={() => dispatch({ type: 'REINSTATE', playerId: p.id, at: Date.now() })}><UserPlus size={13} /></button>
                 ) : (
-                  <button
-                    className="icon-btn warn" title="临时退赛"
-                    onClick={() => { if (window.confirm(`${p.name} 临时退赛？后续轮次不再配对，已赛成绩保留。`)) push({ type: 'WITHDRAW', playerId: p.id, at: Date.now() }); }}
-                  ><UserMinus size={13} /></button>
+                  <button className="icon-btn warn" title="临时退赛" onClick={() => onWithdraw(p.id)}><UserMinus size={13} /></button>
                 )}
               </div>
             ))}
@@ -389,16 +483,15 @@ function PlayersPanel({ st, actor, push }: { st: State; actor: string; push: (e:
 
 // ---------------- 报名/开赛面板 ----------------
 
-function SetupPanel({ st, push }: { st: State; push: (e: Event) => void }) {
+function SetupPanel({ st, dispatch }: { st: State; dispatch: (e: Event) => void }) {
   const [name, setName] = useState(st.name === '未命名赛事' ? '' : st.name);
   const [cfg, setCfg] = useState(st.cfg);
   const num = (v: string, fallback: number) => { const n = parseFloat(v); return Number.isFinite(n) ? n : fallback; };
 
   const start = () => {
-    if (st.players.length < 2) { window.alert('至少 2 名选手才能开赛'); return; }
-    const finalCfg = { ...cfg };
-    push({ type: 'CONFIG', name: name.trim() || '未命名赛事', cfg: finalCfg, at: Date.now() });
-    push({ type: 'START', at: Date.now() });
+    if (st.players.length < 2) return;
+    dispatch({ type: 'CONFIG', name: name.trim() || '未命名赛事', cfg: { ...cfg }, at: Date.now() });
+    dispatch({ type: 'START', at: Date.now() });
   };
 
   return (
@@ -437,7 +530,7 @@ function PairingsView(props: {
   report: (m: Match, r: ResultCode) => void; voidResult: (m: Match) => void; makeup: (m: Match) => void;
   endTournament: () => void;
 }) {
-  const { st, now, shownRound, setViewRound, viewSection, setViewSection, swapMode, setSwapMode, swapSel, clickSlot, genRound, repairRound, endTournament } = props;
+  const { st, actor, now, shownRound, setViewRound, viewSection, setViewSection, swapMode, setSwapMode, swapSel, clickSlot, genRound, repairRound, endTournament } = props;
   const cur = currentRound(st);
   const round = st.rounds.find(r => r.n === shownRound);
   const secs = ['全部', ...[...new Set(st.players.map(p => p.section))].sort()];
@@ -445,7 +538,7 @@ function PairingsView(props: {
     .filter(m => viewSection === '全部' || m.section === viewSection)
     .sort((a, b) => a.table - b.table);
   const isCur = round != null && cur != null && round.n === cur.n;
-  const canRepair = isCur && st.status === 'active' && !round!.matches.some(m => m.result != null || m.submissions.length > 0);
+  const canRepair = isCur && st.status === 'active' && round != null && !roundDirty(round);
 
   return (
     <section>
@@ -479,7 +572,7 @@ function PairingsView(props: {
       <div className="match-list">
         {matches.map(m => (
           <MatchRow
-            key={m.id} m={m} st={st} now={now} round={round!} isCur={isCur}
+            key={m.id} m={m} st={st} actor={actor} now={now} round={round!} isCur={isCur}
             swapMode={swapMode && canRepair} swapSel={swapSel} clickSlot={clickSlot}
             report={props.report} voidResult={props.voidResult} makeup={props.makeup}
             active={st.status === 'active'}
@@ -487,9 +580,7 @@ function PairingsView(props: {
         ))}
         {matches.length === 0 && (
           <div className="empty">
-            {st.rounds.length === 0
-              ? '还没有对阵。点击右上角「生成第 1 轮」开始编排。'
-              : '该轮该组别没有场次。'}
+            {st.rounds.length === 0 ? '还没有对阵。点击下方按钮开始编排。' : '该轮该组别没有场次。'}
           </div>
         )}
         {st.rounds.length === 0 && st.status === 'active' && (
@@ -500,8 +591,8 @@ function PairingsView(props: {
   );
 }
 
-function MatchRow({ m, st, now, round, isCur, swapMode, swapSel, clickSlot, report, voidResult, makeup, active }: {
-  m: Match; st: State; now: number; round: Round; isCur: boolean;
+function MatchRow({ m, st, actor, now, round, isCur, swapMode, swapSel, clickSlot, report, voidResult, makeup, active }: {
+  m: Match; st: State; actor: string; now: number; round: Round; isCur: boolean;
   swapMode: boolean; swapSel: { matchId: string; slot: 1 | 2 } | null;
   clickSlot: (id: string, slot: 1 | 2) => void;
   report: (m: Match, r: ResultCode) => void; voidResult: (m: Match) => void; makeup: (m: Match) => void;
@@ -510,7 +601,9 @@ function MatchRow({ m, st, now, round, isCur, swapMode, swapSel, clickSlot, repo
   const p1 = playerName(st, m.p1), p2 = playerName(st, m.p2);
   const deadline = round.startedAt + st.cfg.timeoutMin * 60_000;
   const overdue = active && isCur && m.result == null && m.status !== 'bye' && now > deadline;
-  const canReport = active && m.status !== 'bye' && !m.supersededBy;
+  const ruled = isRuled(m);
+  const isChief = actor === '裁判长';
+  const canReport = active && m.status !== 'bye' && !m.supersededBy && (!ruled || isChief);
   const swappable = swapMode && m.result == null && m.submissions.length === 0 && m.status !== 'bye';
 
   const slot = (pid: string | null, s: 1 | 2) => {
@@ -523,24 +616,6 @@ function MatchRow({ m, st, now, round, isCur, swapMode, swapSel, clickSlot, repo
       >{pid ? playerName(st, pid) : '—'}</button>
     );
   };
-
-  const resultBtns = (
-    <div className="result-btns">
-      <button className="btn small" onClick={() => report(m, 'W1')}>{p1} 胜</button>
-      <button className="btn small" onClick={() => report(m, 'D')}>和</button>
-      <button className="btn small" onClick={() => report(m, 'W2')}>{p2} 胜</button>
-      <select
-        value=""
-        onChange={e => { if (e.target.value) report(m, e.target.value as ResultCode); e.target.value = ''; }}
-        title="弃权 / 双负"
-      >
-        <option value="" disabled>弃权…</option>
-        <option value="F1">{p1} 弃权负</option>
-        <option value="F2">{p2} 弃权负</option>
-        <option value="DF">双负</option>
-      </select>
-    </div>
-  );
 
   return (
     <div className={`match ${m.status}${m.supersededBy ? ' superseded' : ''}${overdue ? ' overdue' : ''}`}>
@@ -562,6 +637,7 @@ function MatchRow({ m, st, now, round, isCur, swapMode, swapSel, clickSlot, repo
           )}
           {m.status === 'reported' && <span className="tag pending">待第二人确认</span>}
           {m.status === 'confirmed' && m.result != null && <span className="tag ok">已确认</span>}
+          {ruled && <span className="tag ruled"><Gavel size={10} /> 裁判长已裁定</span>}
           {m.status === 'pending' && !m.supersededBy && (
             overdue
               ? <span className="tag danger"><Clock3 size={11} /> 超时未报 {fmtCountdown(now - deadline)}</span>
@@ -595,8 +671,27 @@ function MatchRow({ m, st, now, round, isCur, swapMode, swapSel, clickSlot, repo
       </div>
 
       <div className="match-actions">
-        {canReport && resultBtns}
-        {canReport && m.result != null && (
+        {canReport && (
+          <div className="result-btns">
+            <button className="btn small" onClick={() => report(m, 'W1')}>{p1} 胜</button>
+            <button className="btn small" onClick={() => report(m, 'D')}>和</button>
+            <button className="btn small" onClick={() => report(m, 'W2')}>{p2} 胜</button>
+            <select
+              value=""
+              onChange={e => { if (e.target.value) report(m, e.target.value as ResultCode); e.target.value = ''; }}
+              title="弃权 / 双负"
+            >
+              <option value="" disabled>弃权…</option>
+              <option value="F1">{p1} 弃权负</option>
+              <option value="F2">{p2} 弃权负</option>
+              <option value="DF">双负</option>
+            </select>
+          </div>
+        )}
+        {ruled && !isChief && active && m.status !== 'bye' && !m.supersededBy && (
+          <span className="tag muted">已裁定，如需改判请切换裁判长</span>
+        )}
+        {active && m.result != null && m.status !== 'bye' && (
           <button className="icon-btn warn" title="撤销结果，重新报分" onClick={() => voidResult(m)}><RotateCcw size={14} /></button>
         )}
         {active && !m.supersededBy && (m.result === 'DF' || m.result === 'F1' || m.result === 'F2') && (
@@ -637,9 +732,9 @@ function RankView({ st }: { st: State }) {
   );
 }
 
-// ---------------- 裁定链（事件流 + 任意步恢复） ----------------
+// ---------------- 裁定链（事件流 + 任意步恢复 + 回退分支存档） ----------------
 
-function LogView({ doc, st, restoreTo }: { doc: Doc; st: State; restoreTo: (head: number, label: string) => void }) {
+function LogView({ doc, st, askRestore }: { doc: Doc; st: State; askRestore: (k: number, label: string) => void }) {
   type Item = { at: number; kind: 'event'; ev: Event; idx: number; active: boolean } | { at: number; kind: 'meta'; text: string };
   const items: Item[] = [
     ...doc.events.map((ev, idx) => ({ at: ev.at, kind: 'event' as const, ev, idx, active: idx < doc.head })),
@@ -659,30 +754,44 @@ function LogView({ doc, st, restoreTo }: { doc: Doc; st: State; restoreTo: (head
             <span className="log-time">{fmtTime(it.at)}</span>
             <span className="log-text">{describeEvent(it.ev, st)}</span>
             {!it.active && <span className="tag muted">已回退</span>}
-            <button className="btn tiny" onClick={() => restoreTo(it.idx + 1, `第 ${it.idx + 1} 步之后`)}>回到此步</button>
+            <button className="btn tiny" onClick={() => askRestore(it.idx + 1, `第 ${it.idx + 1} 步之后`)}>回到此步</button>
           </div>
         ))}
       </div>
+
+      {doc.branches.length > 0 && (
+        <div className="branch-section">
+          <h3>回退分支（仅作记录，不影响当前进度）</h3>
+          {doc.branches.map(b => (
+            <details key={b.id} className="branch">
+              <summary>{b.label} · {b.events.length} 步 · 存档于 {fmtTime(b.archivedAt)}</summary>
+              {b.events.map((e, i) => <p key={i}>{fmtTime(e.at)} · {describeEvent(e, st)}</p>)}
+            </details>
+          ))}
+        </div>
+      )}
     </section>
   );
 }
 
 // ---------------- 快照 ----------------
 
-function SnapView({ doc, restoreTo, delSnap }: { doc: Doc; restoreTo: (h: number, l: string) => void; delSnap: (id: string) => void }) {
+function SnapView({ doc, askRestoreSnap, delSnap }: {
+  doc: Doc; askRestoreSnap: (id: string, label: string) => void; delSnap: (id: string) => void;
+}) {
   return (
     <section>
-      <p className="hint">快照是命名的时间点（生成新一轮时会自动存档）。恢复快照只移动进度指针，原始记录全部保留。</p>
+      <p className="hint">快照保存完整进度（生成新一轮时自动存档）。恢复快照只切换活动链，当前进度会存入回退分支，不会丢失。</p>
       <div className="snap-list">
         {doc.snaps.length === 0 && <div className="empty">还没有快照。点击顶栏「快照」保存当前进度。</div>}
         {[...doc.snaps].reverse().map(s => (
-          <div key={s.id} className={s.head === doc.head ? 'snap-row current' : 'snap-row'}>
+          <div key={s.id} className={s.chain.length === doc.head ? 'snap-row current' : 'snap-row'}>
             <Camera size={14} />
             <div className="snap-info">
               <b>{s.label}{s.auto && <span className="tag muted"> 自动</span>}</b>
-              <span>{new Date(s.at).toLocaleString('zh-CN')} · 第 {s.head} 步{s.head === doc.head ? ' · 当前位置' : ''}</span>
+              <span>{new Date(s.at).toLocaleString('zh-CN')} · 第 {s.chain.length} 步{s.chain.length === doc.head ? ' · 当前位置' : ''}</span>
             </div>
-            <button className="btn small" onClick={() => restoreTo(s.head, s.label)}>恢复</button>
+            <button className="btn small" onClick={() => askRestoreSnap(s.id, s.label)}>恢复</button>
             <button className="icon-btn" title="删除快照" onClick={() => delSnap(s.id)}><Trash2 size={13} /></button>
           </div>
         ))}

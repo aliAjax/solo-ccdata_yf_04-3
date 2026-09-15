@@ -34,6 +34,8 @@ export interface Adjudication {
   result: ResultCode | null; // null 表示撤销结果
   note: string;
   at: number;
+  /** ruling=裁判长裁定 correction=裁判更正本人报分 auto=系统自动判负 void=撤销 */
+  kind?: 'ruling' | 'correction' | 'auto' | 'void';
 }
 
 export type MatchStatus = 'pending' | 'reported' | 'confirmed' | 'conflict' | 'bye';
@@ -79,7 +81,7 @@ export type Event =
   | { type: 'REINSTATE'; playerId: ID; at: number }
   | { type: 'START'; at: number }
   | { type: 'NEW_ROUND'; round: Round; forfeits: { matchId: ID; note: string }[]; at: number }
-  | { type: 'REPAIR_ROUND'; round: Round; at: number }
+  | { type: 'REPAIR_ROUND'; round: Round; reason?: string; auto?: boolean; at: number }
   | { type: 'SWAP'; matchA: ID; slotA: 1 | 2; matchB: ID; slotB: 1 | 2; actor: string; at: number }
   | { type: 'SUBMIT'; matchId: ID; actor: string; result: ResultCode; at: number }
   | { type: 'ADJUDICATE'; matchId: ID; actor: string; result: ResultCode; note: string; at: number }
@@ -130,6 +132,20 @@ const isPlayedGame = (m: Match) =>
 
 /** 计入排名的对局（有官方结果且未被补赛替代） */
 const isCounted = (m: Match) => !m.supersededBy && m.result != null;
+
+/** 轮次是否已有实质进展（有结果或报分）；轮空不算 */
+export const roundDirty = (r: Round): boolean =>
+  r.matches.some(m => m.status !== 'bye' && (m.result != null || m.submissions.length > 0));
+
+/** 裁判长是否已作出最终裁定（撤销后重新开放报分） */
+export function isRuled(m: Match): boolean {
+  for (let i = m.adjudications.length - 1; i >= 0; i--) {
+    const a = m.adjudications[i];
+    if (a.kind === 'void' || a.result == null) return false;
+    if (a.kind === 'ruling') return true;
+  }
+  return false;
+}
 
 // ---------------- 排名 ----------------
 
@@ -239,9 +255,9 @@ export interface PairingPlan {
   warnings: string[];
 }
 
-/** 为某一组别生成下一轮配对 */
-export function pairSection(st: State, section: string, roundNo: number, tableBase: number, salt: number): PairingPlan {
-  const rows = standings(st, section).filter(r => !r.player.withdrawn);
+/** 为某一组别生成下一轮配对；exclude 中的选手（如已安排补赛者）不参与 */
+export function pairSection(st: State, section: string, roundNo: number, tableBase: number, salt: number, exclude?: Set<ID>): PairingPlan {
+  const rows = standings(st, section).filter(r => !r.player.withdrawn && !exclude?.has(r.player.id));
   const all = st.rounds.flatMap(r => r.matches);
   const played = new Set<string>();
   const byeCount = new Map<ID, number>();
@@ -292,15 +308,15 @@ export function pairSection(st: State, section: string, roundNo: number, tableBa
 }
 
 /** 为全部组别生成新一轮（含桌号衔接） */
-export function planRound(st: State, salt: number): { round: Round; warnings: string[] } {
+export function planRound(st: State, salt: number, exclude?: Set<ID>): { round: Round; warnings: string[] } {
   const roundNo = st.rounds.length + 1;
-  const sections = [...new Set(st.players.filter(p => !p.withdrawn).map(p => p.section))].sort();
+  const sections = [...new Set(st.players.filter(p => !p.withdrawn && !exclude?.has(p.id)).map(p => p.section))].sort();
   const warnings: string[] = [];
   const matches: Match[] = [];
   let tableBase = 0;
   let seq = st.seq;
   for (const sec of sections) {
-    const plan = pairSection(st, sec, roundNo, tableBase, salt);
+    const plan = pairSection(st, sec, roundNo, tableBase, salt, exclude);
     warnings.push(...plan.warnings.map(w => `【${sec}】${w}`));
     for (const m of plan.matches) {
       matches.push({ ...m, id: `m${seq++}` });
@@ -351,7 +367,7 @@ export function apply(st: State, ev: Event): void {
         if (m && m.result == null && m.status !== 'bye') {
           m.result = 'DF';
           m.status = 'confirmed';
-          m.adjudications.push({ actor: '系统', result: 'DF', note: f.note, at: ev.at });
+          m.adjudications.push({ actor: '系统', result: 'DF', note: f.note, at: ev.at, kind: 'auto' });
         }
       }
       st.rounds.push({ ...ev.round, matches: ev.round.matches.map(m => ({ ...m, submissions: [...m.submissions], adjudications: [...m.adjudications] })) });
@@ -362,9 +378,7 @@ export function apply(st: State, ev: Event): void {
     case 'REPAIR_ROUND': {
       const idx = st.rounds.findIndex(r => r.n === ev.round.n);
       if (idx >= 0) {
-        const old = st.rounds[idx];
-        const dirty = old.matches.some(m => m.result != null || m.submissions.length > 0);
-        if (!dirty) {
+        if (!roundDirty(st.rounds[idx])) {
           st.rounds[idx] = ev.round;
           const maxSeq = Math.max(0, ...ev.round.matches.map(m => parseInt(m.id.replace(/\D/g, '') || '0', 10)));
           st.seq = Math.max(st.seq, maxSeq + 1);
@@ -386,28 +400,27 @@ export function apply(st: State, ev: Event): void {
     case 'SUBMIT': {
       const m = findMatch(st, ev.matchId);
       if (!m || m.status === 'bye' || m.result === 'BYE') break;
+      if (isRuled(m)) break; // 裁判长已裁定，普通报分不再改动（撤销后重新开放）
       const mine = m.submissions.find(s => s.actor === ev.actor);
       if (mine) {
-        // 同一裁判改自己的报分：更新并留痕，不静默
-        m.adjudications.push({ actor: ev.actor, result: ev.result, note: `更正本人此前报分（${resultLabel(mine.result)} → ${resultLabel(ev.result)}）`, at: ev.at });
-        mine.result = ev.result;
-        mine.at = ev.at;
-        if (m.submissions.length === 1) m.result = ev.result;
-        break;
-      }
-      m.submissions.push({ actor: ev.actor, result: ev.result, at: ev.at });
-      if (m.submissions.length === 1) {
-        m.result = ev.result;
-        m.status = 'reported';
-      } else {
-        const [s1, s2] = m.submissions;
-        if (s1.result === s2.result) {
-          m.result = ev.result;
-          m.status = 'confirmed';
-        } else {
-          // 两名裁判报分不一致：保留冲突，官方结果维持首报，等待裁定
-          m.status = 'conflict';
+        // 同一裁判更正本人报分：更新并留痕，不静默
+        if (mine.result !== ev.result) {
+          m.adjudications.push({ actor: ev.actor, result: ev.result, note: `更正本人报分（${resultLabel(mine.result)} → ${resultLabel(ev.result)}）`, at: ev.at, kind: 'correction' });
+          mine.result = ev.result;
+          mine.at = ev.at;
         }
+      } else {
+        if (m.submissions.length >= 2) break; // 已有两名裁判报分，等待裁定
+        m.submissions.push({ actor: ev.actor, result: ev.result, at: ev.at });
+      }
+      // 统一重估：两份最新报分一致 → 自动确认（冲突随之解除）；不一致 → 保留冲突
+      if (m.submissions.length === 1) {
+        m.result = m.submissions[0].result;
+        m.status = 'reported';
+      } else if (m.submissions.length >= 2) {
+        const [s1, s2] = m.submissions;
+        m.result = s1.result; // 冲突期间官方结果暂按首报
+        m.status = s1.result === s2.result ? 'confirmed' : 'conflict';
       }
       break;
     }
@@ -416,7 +429,7 @@ export function apply(st: State, ev: Event): void {
       if (!m || m.status === 'bye') break;
       m.result = ev.result;
       m.status = 'confirmed';
-      m.adjudications.push({ actor: ev.actor, result: ev.result, note: ev.note, at: ev.at });
+      m.adjudications.push({ actor: ev.actor, result: ev.result, note: ev.note, at: ev.at, kind: 'ruling' });
       break;
     }
     case 'VOID': {
@@ -425,7 +438,7 @@ export function apply(st: State, ev: Event): void {
       m.result = null;
       m.status = 'pending';
       m.submissions = [];
-      m.adjudications.push({ actor: ev.actor, result: null, note: ev.note || '撤销结果，待重报', at: ev.at });
+      m.adjudications.push({ actor: ev.actor, result: null, note: ev.note || '撤销结果，待重报', at: ev.at, kind: 'void' });
       break;
     }
     case 'MAKEUP': {
@@ -453,6 +466,56 @@ export function reduceEvents(events: Event[]): State {
 // ---------------- 查询辅助 ----------------
 
 export const currentRound = (st: State): Round | undefined => st.rounds[st.rounds.length - 1];
+
+/**
+ * 较早赛果变更后，最新轮（尚未有任何报分）是否应按最新排名重排。
+ * 返回 REPAIR_ROUND 事件（auto 标记，撤销时随触发事件一起回退）；不需要则返回 null。
+ * 原对阵保留在旧 NEW_ROUND 事件里，历史不被改写；补赛场次保留且其选手不参与重排。
+ */
+export function maybeRepair(st: State, trigger: Event, now: number): Event | null {
+  if (st.status !== 'active') return null;
+  const cur = currentRound(st);
+  if (!cur) return null;
+  let affects = false;
+  switch (trigger.type) {
+    case 'WITHDRAW':
+    case 'REINSTATE':
+      affects = true;
+      break;
+    case 'SUBMIT':
+    case 'ADJUDICATE':
+    case 'VOID': {
+      const m = findMatch(st, trigger.matchId);
+      affects = !!m && m.round < cur.n;
+      break;
+    }
+    case 'MAKEUP': {
+      const m = findMatch(st, trigger.originalId);
+      affects = !!m && m.round < cur.n;
+      break;
+    }
+    default:
+      break;
+  }
+  if (!affects) return null;
+  if (roundDirty(cur)) return null; // 最新轮已开赛，不动
+  const carry = cur.matches.filter(m => m.origin === 'makeup');
+  const exclude = new Set<ID>(carry.flatMap(m => [m.p1, m.p2].filter((x): x is ID => x != null)));
+  const plan = planRound(st, now, exclude);
+  const newSwiss = plan.round.matches.map(m => ({ ...m, round: cur.n }));
+  const sig = (ms: { section: string; p1: ID; p2: ID | null }[]) =>
+    ms.map(m => `${m.section}:${m.p1}:${m.p2 ?? 'BYE'}`).sort().join(';');
+  const oldSwiss = cur.matches.filter(m => m.origin === 'swiss');
+  if (sig(oldSwiss) === sig(newSwiss)) return null; // 配对无变化，不制造噪音事件
+  const all = [...newSwiss, ...carry].map((m, i) => ({ ...m, table: i + 1 }));
+  return {
+    type: 'REPAIR_ROUND',
+    round: { n: cur.n, startedAt: now, matches: all },
+    reason: '较早赛果变更，按最新排名重排',
+    auto: true,
+    at: now,
+  };
+}
 
 export function unresolvedMatches(st: State): Match[] {
   return st.rounds.flatMap(r => r.matches).filter(m => m.result == null && m.status !== 'bye' && !m.supersededBy);
@@ -487,7 +550,7 @@ export function describeEvent(ev: Event, st: State): string {
     case 'REINSTATE': return `${name(ev.playerId)} 恢复参赛`;
     case 'START': return '开赛';
     case 'NEW_ROUND': return `生成第 ${ev.round.n} 轮对阵（${ev.round.matches.length} 场）${ev.forfeits.length ? `，${ev.forfeits.length} 场超时未报自动双负` : ''}`;
-    case 'REPAIR_ROUND': return `重新编排第 ${ev.round.n} 轮`;
+    case 'REPAIR_ROUND': return `重新编排第 ${ev.round.n} 轮${ev.reason ? `（${ev.reason}）` : ''}`;
     case 'SWAP': return `${ev.actor} 改配：调整两台对阵`;
     case 'SUBMIT': return `${ev.actor} 报分：${resultLabel(ev.result)}`;
     case 'ADJUDICATE': return `${ev.actor} 裁定：${resultLabel(ev.result)}${ev.note ? `（${ev.note}）` : ''}`;
